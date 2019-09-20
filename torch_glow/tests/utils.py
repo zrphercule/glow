@@ -25,7 +25,7 @@ def jitVsGlow_(f_torch, f_glow, *inputs, expected_fused_ops=None,
         torch_trace = torch.jit.trace(f_torch, inputs)
         torch_res = torch_trace(*inputs)
 
-        torch_glow.enableFusionPass()
+        #torch_glow.enableFusionPass()
         glow_trace = torch.jit.trace(f_glow, inputs)
         glow_res = glow_trace(*inputs)
 

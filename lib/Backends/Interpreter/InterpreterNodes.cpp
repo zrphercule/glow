@@ -4135,6 +4135,134 @@ void BoundInterpreterFunction::fwdFullyConnectedInst(
 }
 
 //===----------------------------------------------------------------------===//
+//                       Dynamic quantized FC
+//===----------------------------------------------------------------------===//
+
+// Get quantized params of bias for Dynamic Quantized Fully Connected.
+template <typename T>
+static glow::TensorQuantizationParams
+getQParamsForDQFCBias(glow::Tensor *biasTensor) {
+  auto biasFW = biasTensor->getHandle<T>();
+  auto biasMinMax = biasFW.minMaxArg();
+  auto biasMin = biasFW.raw(biasMinMax.first);
+  auto biasMax = biasFW.raw(biasMinMax.second);
+
+  auto biasParams = quantization::chooseQuantizationParams(
+      {biasMin, biasMax}, quantization::Schema::Symmetric, ElemKind::Int32QTy);
+  return biasParams;
+};
+
+template <typename ElemTy, typename OutputTy, typename AccumulatorTy,
+          typename BiasElemTy>
+void BoundInterpreterFunction::fwdDynRowwiseQuantizedFullyConnectedInstImpl(
+    Handle<ElemTy> inW, Handle<OutputTy> &outW, size_t baseRow,
+    Handle<ElemTy> weightsW, Handle<BiasElemTy> biasW, Handle<float> scalesW,
+    Handle<int32_t> offsetsW) {
+  ShapeHW idim(inW.dims());
+  ShapeHW odim(outW.dims());
+  auto inTy = inW.getType();
+  auto biasTy = biasW.getType();
+  int32_t inOffset = inTy.getOffset();
+  int32_t biasOffset = biasTy.getOffset();
+  float inScale = inTy.getScale();
+  float biasScale = biasTy.getScale();
+
+  for (dim_t i = 0; i < idim.height; i++) {
+    for (dim_t j = 0; j < odim.width; j++) {
+      float matMulScale = scalesW.raw(j) * inScale;
+      AccumulatorTy sum = 0;
+      for (dim_t k = 0; k < idim.width; k++) {
+        AccumulatorTy W = weightsW.at({k, j});
+        AccumulatorTy A = inW.at({i, k});
+        sum += (W - offsetsW.raw(j)) * (A - inOffset);
+      }
+
+      // Scale the bias to match the scale of the matrix multiplication.
+      AccumulatorTy B = std::round(float(biasW.at({j}) - biasOffset) *
+                                   (biasScale / matMulScale));
+      // Add the bias.
+      sum += B;
+
+      // Scale the result back to the expected destination scale.
+      outW.at({baseRow + i, j}) = float(sum) * matMulScale;
+    }
+  }
+}
+
+void BoundInterpreterFunction::fwdDynamicQuantizedFullyConnectedInst(
+    const glow::DynamicQuantizedFullyConnectedInst *I) {
+
+  auto *inputTensor = getTensor(I->getSrc());
+  auto *weightsTensor = getTensor(I->getWeights());
+  auto *biasTensor = getTensor(I->getBias());
+  auto *resultTensor = getTensor(I->getDest());
+  Tensor qBiasTensor;
+
+  if (biasTensor->getType().getElementType() == ElemKind::FloatTy) {
+    auto qParams = getQParamsForDQFCBias<float>(biasTensor);
+    qBiasTensor = quantization::quantizeTensor(
+        *biasTensor, {qParams.scale, qParams.offset}, ElemKind::Int32QTy);
+    biasTensor = &qBiasTensor;
+  } else if (biasTensor->getType().getElementType() == ElemKind::Float16Ty) {
+    auto qParams = getQParamsForDQFCBias<float16_t>(biasTensor);
+    qBiasTensor = quantization::quantizeTensor(
+        *biasTensor, {qParams.scale, qParams.offset}, ElemKind::Int32QTy);
+    biasTensor = &qBiasTensor;
+  }
+
+  auto weightsW = weightsTensor->getHandle<int8_t>();
+  auto biasW = biasTensor->getHandle<int32_t>();
+
+  /* Check the options */
+  auto isSymmetric = I->getIsSymmetric();
+  auto isPerBatchElement = I->getIsPerBatchElement();
+  assert(isSymmetric && "Only symmetric quantization is supported.");
+  assert(isPerBatchElement && "Only quantized per batch element is supported.");
+
+  /* Dynamic Quantization */
+  // Calculate quantized params needed for Input.
+  auto inputHandle = inputTensor->getHandle<float16_t>();
+  auto resultHandle = resultTensor->getHandle<float16_t>();
+  size_t N = inputTensor->dims()[0];
+  size_t L = inputTensor->dims()[1];
+  size_t M = resultTensor->dims()[1];
+  // Calc channelwise QParam
+  Tensor scaleTensor = Tensor(ElemKind::FloatTy, {M});
+  Tensor offsetTensor = Tensor(ElemKind::Int32ITy, {M});
+  auto scalesW = scaleTensor.getHandle<float>();
+  auto offsetsW = offsetTensor.getHandle<int32_t>();
+  for (int i = 0; i < M; i++) {
+    scalesW.raw(i) = weightsW.getType().getScale();
+    offsetsW.raw(i) = weightsW.getType().getOffset();
+  }
+  if (isPerBatchElement) {
+    // We slice N * L input tensor to N tensors with 1 * L shape,
+    // For each batch we calculate qparams, quantize, FC and dequantize
+    // independently, and finally splice them together.
+    for (size_t i = 0; i < N; i++) {
+      Tensor slicedInputTensor = inputTensor->getOwnedSlice({1, L}, {i, 0});
+      auto slicedInputHandle = slicedInputTensor.getHandle<float16_t>();
+      auto minMax = slicedInputHandle.minMaxArg();
+      auto qMin = slicedInputHandle.raw(minMax.first);
+      auto qMax = slicedInputHandle.raw(minMax.second);
+
+      auto qParams = quantization::chooseQuantizationParams(
+          {qMin, qMax}, quantization::Schema::Symmetric, ElemKind::Int8QTy);
+      Tensor qInputTensor = quantization::quantizeTensor(
+          slicedInputTensor, {qParams.scale, qParams.offset},
+          ElemKind::Int8QTy);
+      auto inW = qInputTensor.getHandle<int8_t>();
+      // TODO Scale elemkind should be selectable
+
+      /* Quantized FullyConnected, genenrating fp16 output tensor*/
+      fwdDynRowwiseQuantizedFullyConnectedInstImpl<int8_t, float16_t, int32_t,
+                                                   int32_t>(
+          inW, resultHandle, i, weightsW, biasW, scalesW, offsetsW);
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
 //                       Row-wise quantized FC
 //===----------------------------------------------------------------------===//
 template <typename ElemTy, typename AccumulatorTy, typename BiasElemTy>

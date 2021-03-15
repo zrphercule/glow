@@ -362,6 +362,21 @@ static NodeSupportLevels isNodeSupported(const NodeInfo &NI) {
                                  NI.getOutElemTy(ConvertToNode::ResultIdx));
     break;
   }
+  case Kinded::Kind::DynamicQuantizedFullyConnectedNodeKind:
+    isNodePrecisionSupported =
+        (NI.getInElemTy(DynamicQuantizedFullyConnectedNode::InputIdx) ==
+             ElemKind::Float16Ty ||
+         NI.getInElemTy(DynamicQuantizedFullyConnectedNode::InputIdx) ==
+             ElemKind::FloatTy) &&
+        NI.getInElemTy(DynamicQuantizedFullyConnectedNode::WeightsIdx) ==
+            ElemKind::Int8QTy &&
+        (NI.getInElemTy(DynamicQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::FloatTy ||
+         NI.getInElemTy(DynamicQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::Float16Ty ||
+         NI.getInElemTy(DynamicQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::Int32ITy);
+    break;
   case Kinded::Kind::FullyConnectedNodeKind:
     if (!NI.getInTy(FullyConnectedNode::InputIdx)->isQuantizedType()) {
       isNodePrecisionSupported = NI.allInputsAndOutputsHaveSameElemKind(

@@ -362,6 +362,7 @@ static NodeSupportLevels isNodeSupported(const NodeInfo &NI) {
                                  NI.getOutElemTy(ConvertToNode::ResultIdx));
     break;
   }
+
   case Kinded::Kind::DynamicQuantizedFullyConnectedNodeKind:
     isNodePrecisionSupported =
         (NI.getInElemTy(DynamicQuantizedFullyConnectedNode::InputIdx) ==
@@ -376,6 +377,28 @@ static NodeSupportLevels isNodeSupported(const NodeInfo &NI) {
              ElemKind::Float16Ty ||
          NI.getInElemTy(DynamicQuantizedFullyConnectedNode::BiasIdx) ==
              ElemKind::Int32ITy);
+    break;
+
+  case Kinded::Kind::DynamicRowwiseQuantizedFullyConnectedNodeKind:
+    isNodePrecisionSupported =
+        (NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::InputIdx) ==
+             ElemKind::Float16Ty ||
+         NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::InputIdx) ==
+             ElemKind::FloatTy) &&
+        NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::WeightsIdx) ==
+            ElemKind::Int8QTy &&
+        (NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::FloatTy ||
+         NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::Float16Ty ||
+         NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::Int32ITy) &&
+        (NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::ScalesIdx) ==
+             ElemKind::FloatTy ||
+         NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::ScalesIdx) ==
+             ElemKind::Float16Ty) &&
+        NI.getInElemTy(DynamicRowwiseQuantizedFullyConnectedNode::OffsetsIdx) ==
+            ElemKind::Int32ITy;
     break;
   case Kinded::Kind::FullyConnectedNodeKind:
     if (!NI.getInTy(FullyConnectedNode::InputIdx)->isQuantizedType()) {

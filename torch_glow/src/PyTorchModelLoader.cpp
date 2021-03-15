@@ -2402,11 +2402,6 @@ Error PyTorchModelLoader::loadDynQuantizedLinear(
   bool isRowwiseQuantized = ptWeightTensor.is_quantized() &&
                             ptWeightTensor.qscheme() == at::kPerChannelAffine;
 
-  // TODO Support rowwise quantized weights
-  RETURN_ERR_IF_NOT(
-      !isRowwiseQuantized,
-      "Rowwise quantized dynamic quantized linear is not supported in Glow.");
-
   c10::ScalarType dtype;
   RETURN_IF_ERR(
       getCorrectTypeMapping(dtype, inputs[QuantizedLinearInputs::input]));
@@ -2418,10 +2413,18 @@ Error PyTorchModelLoader::loadDynQuantizedLinear(
   }
 
   NodeValue output;
-  auto fc = F_.createDynamicQuantizedFullyConnected("dynamic_quantized_fc",
-                                                    input, weights, bias);
-  output = fc->getResult();
-
+  NodeValue wScales, wOffsets;
+  if (isRowwiseQuantized) {
+    std::tie(wScales, wOffsets) = extractChannelwiseQParams(F_, ptWeightTensor);
+    auto fc = F_.createDynamicRowwiseQuantizedFullyConnected(
+        "dynamic_rowwise_quantized_fc", input, weights, bias, wScales,
+        wOffsets);
+    output = fc->getResult();
+  } else {
+    auto fc = F_.createDynamicQuantizedFullyConnected("dynamic_quantized_fc",
+                                                      input, weights, bias);
+    output = fc->getResult();
+  }
   // Restore original outer dims
   if (inputDims.size() > 2) {
     std::vector<dim_t> finalDims = inputDims.vec();

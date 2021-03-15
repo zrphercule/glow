@@ -4153,11 +4153,11 @@ getQParamsForDQFCBias(glow::Tensor *biasTensor) {
 };
 
 template <typename ElemTy, typename OutputTy, typename AccumulatorTy,
-          typename BiasElemTy>
+          typename BiasElemTy, typename ScalesElemTy>
 void BoundInterpreterFunction::fwdDynRowwiseQuantizedFullyConnectedInstImpl(
     Handle<ElemTy> inW, Handle<OutputTy> &outW, size_t baseRow,
-    Handle<ElemTy> weightsW, Handle<BiasElemTy> biasW, Handle<float> scalesW,
-    Handle<int32_t> offsetsW) {
+    Handle<ElemTy> weightsW, Handle<BiasElemTy> biasW,
+    Handle<ScalesElemTy> scalesW, Handle<int32_t> offsetsW) {
   ShapeHW idim(inW.dims());
   ShapeHW odim(outW.dims());
   auto inTy = inW.getType();
@@ -4169,7 +4169,7 @@ void BoundInterpreterFunction::fwdDynRowwiseQuantizedFullyConnectedInstImpl(
 
   for (dim_t i = 0; i < idim.height; i++) {
     for (dim_t j = 0; j < odim.width; j++) {
-      float matMulScale = scalesW.raw(j) * inScale;
+      float matMulScale = inScale * static_cast<float>(scalesW.raw(j));
       AccumulatorTy sum = 0;
       for (dim_t k = 0; k < idim.width; k++) {
         AccumulatorTy W = weightsW.at({k, j});
@@ -4189,13 +4189,14 @@ void BoundInterpreterFunction::fwdDynRowwiseQuantizedFullyConnectedInstImpl(
   }
 }
 
-void BoundInterpreterFunction::fwdDynamicQuantizedFullyConnectedInst(
-    const glow::DynamicQuantizedFullyConnectedInst *I) {
+void BoundInterpreterFunction::fwdDynRowwiseQuantizedFullyConnectedInstPreimpl(
+    Tensor *inputTensor, Tensor *weightsTensor, Tensor *biasTensor,
+    Tensor *resultTensor, Tensor *wScaleTensor, Tensor *wOffsetTensor,
+    bool isSymmetric, bool isPerBatchElement) {
 
-  auto *inputTensor = getTensor(I->getSrc());
-  auto *weightsTensor = getTensor(I->getWeights());
-  auto *biasTensor = getTensor(I->getBias());
-  auto *resultTensor = getTensor(I->getDest());
+  /* Check the options */
+  assert(isSymmetric && "Only symmetric quantization is supported.");
+  assert(isPerBatchElement && "Only quantized per batch element is supported.");
   Tensor qBiasTensor;
 
   if (biasTensor->getType().getElementType() == ElemKind::FloatTy) {
@@ -4213,28 +4214,13 @@ void BoundInterpreterFunction::fwdDynamicQuantizedFullyConnectedInst(
   auto weightsW = weightsTensor->getHandle<int8_t>();
   auto biasW = biasTensor->getHandle<int32_t>();
 
-  /* Check the options */
-  auto isSymmetric = I->getIsSymmetric();
-  auto isPerBatchElement = I->getIsPerBatchElement();
-  assert(isSymmetric && "Only symmetric quantization is supported.");
-  assert(isPerBatchElement && "Only quantized per batch element is supported.");
-
   /* Dynamic Quantization */
   // Calculate quantized params needed for Input.
-  auto inputHandle = inputTensor->getHandle<float16_t>();
   auto resultHandle = resultTensor->getHandle<float16_t>();
+  auto offsetsW = wOffsetTensor->getHandle<int32_t>();
   size_t N = inputTensor->dims()[0];
   size_t L = inputTensor->dims()[1];
   size_t M = resultTensor->dims()[1];
-  // Calc channelwise QParam
-  Tensor scaleTensor = Tensor(ElemKind::FloatTy, {M});
-  Tensor offsetTensor = Tensor(ElemKind::Int32ITy, {M});
-  auto scalesW = scaleTensor.getHandle<float>();
-  auto offsetsW = offsetTensor.getHandle<int32_t>();
-  for (int i = 0; i < M; i++) {
-    scalesW.raw(i) = weightsW.getType().getScale();
-    offsetsW.raw(i) = weightsW.getType().getOffset();
-  }
   if (isPerBatchElement) {
     // We slice N * L input tensor to N tensors with 1 * L shape,
     // For each batch we calculate qparams, quantize, FC and dequantize
@@ -4252,14 +4238,62 @@ void BoundInterpreterFunction::fwdDynamicQuantizedFullyConnectedInst(
           slicedInputTensor, {qParams.scale, qParams.offset},
           ElemKind::Int8QTy);
       auto inW = qInputTensor.getHandle<int8_t>();
-      // TODO Scale elemkind should be selectable
-
       /* Quantized FullyConnected, genenrating fp16 output tensor*/
-      fwdDynRowwiseQuantizedFullyConnectedInstImpl<int8_t, float16_t, int32_t,
-                                                   int32_t>(
-          inW, resultHandle, i, weightsW, biasW, scalesW, offsetsW);
+      if (wScaleTensor->getElementType() == ElemKind::FloatTy) {
+        auto scalesW = wScaleTensor->getHandle<float>();
+        fwdDynRowwiseQuantizedFullyConnectedInstImpl<int8_t, float16_t, int32_t,
+                                                     int32_t, float>(
+            inW, resultHandle, i, weightsW, biasW, scalesW, offsetsW);
+      } else {
+
+        auto scalesW = wScaleTensor->getHandle<float16_t>();
+        fwdDynRowwiseQuantizedFullyConnectedInstImpl<int8_t, float16_t, int32_t,
+                                                     int32_t, float16_t>(
+            inW, resultHandle, i, weightsW, biasW, scalesW, offsetsW);
+      }
     }
   }
+}
+
+void BoundInterpreterFunction::fwdDynamicRowwiseQuantizedFullyConnectedInst(
+    const glow::DynamicRowwiseQuantizedFullyConnectedInst *I) {
+  auto *inputTensor = getTensor(I->getSrc());
+  auto *weightsTensor = getTensor(I->getWeights());
+  auto *biasTensor = getTensor(I->getBias());
+  auto *resultTensor = getTensor(I->getDest());
+  auto *scaleTensor = getTensor(I->getScales());
+  auto *offsetTensor = getTensor(I->getOffsets());
+  auto isSymmetric = I->getIsSymmetric();
+  auto isPerBatchElement = I->getIsPerBatchElement();
+  fwdDynRowwiseQuantizedFullyConnectedInstPreimpl(
+      inputTensor, weightsTensor, biasTensor, resultTensor, scaleTensor,
+      offsetTensor, isSymmetric, isPerBatchElement);
+}
+
+void BoundInterpreterFunction::fwdDynamicQuantizedFullyConnectedInst(
+    const glow::DynamicQuantizedFullyConnectedInst *I) {
+
+  auto *inputTensor = getTensor(I->getSrc());
+  auto *weightsTensor = getTensor(I->getWeights());
+  auto *biasTensor = getTensor(I->getBias());
+  auto *resultTensor = getTensor(I->getDest());
+  auto isSymmetric = I->getIsSymmetric();
+  auto isPerBatchElement = I->getIsPerBatchElement();
+  size_t M = resultTensor->dims()[1];
+
+  // Calc channelwise QParam
+  Tensor scaleTensor = Tensor(ElemKind::FloatTy, {M});
+  Tensor offsetTensor = Tensor(ElemKind::Int32ITy, {M});
+  auto scalesW = scaleTensor.getHandle<float>();
+  auto offsetsW = offsetTensor.getHandle<int32_t>();
+  auto weightsW = weightsTensor->getHandle<int8_t>();
+  for (int i = 0; i < M; i++) {
+    scalesW.raw(i) = weightsW.getType().getScale();
+    offsetsW.raw(i) = weightsW.getType().getOffset();
+  }
+  fwdDynRowwiseQuantizedFullyConnectedInstPreimpl(
+      inputTensor, weightsTensor, biasTensor, resultTensor, &scaleTensor,
+      &offsetTensor, isSymmetric, isPerBatchElement);
 }
 
 //===----------------------------------------------------------------------===//
